@@ -97,7 +97,7 @@ async def fetch_understat_data(gw_reference_df):
         pd.DataFrame: A DataFrame containing detailed Understat data for matched games,
                       or an empty DataFrame if no data could be fetched.
     """
-    start_year = 2016
+    start_year = 2020
     end_year = 2025
     all_player_rows = []
     appended_rows_count = 0
@@ -309,7 +309,7 @@ async def fetch_understat_data(gw_reference_df):
     return df[final_output_columns]
 
 
-async def load_and_process_data(base_url, start_season=2020, end_season=2023,
+async def load_and_process_data(base_url, start_season=2020, end_season=2024,
                                 target_season_context='2024-25'):
     """
     Consolidates the entire data ingestion pipeline:
@@ -322,7 +322,7 @@ async def load_and_process_data(base_url, start_season=2020, end_season=2023,
     """
     # --- MODIFIED: Part 1: Load the pre-processed FPL Data CSV ---
     print("--- Part 1: Loading pre-processed FPL data ---")
-    fpl_data_url = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/cleaned/cleaned_merged_seasons_team_aggregated.csv"
+    fpl_data_url = "cleaned_merged_seasons_team_aggregated.csv"
     try:
         fpl_df = pd.read_csv(fpl_data_url)
         print(f"Successfully loaded FPL data from your specified file. Initial shape: {fpl_df.shape}")
@@ -348,64 +348,27 @@ async def load_and_process_data(base_url, start_season=2020, end_season=2023,
 
     # --- Part 2: Fetch and Match Understat Data ---
     print("\n--- Part 2: Fetching and matching Understat data ---")
-    all_player_rows = []
-    fpl_player_game_lookup = defaultdict(list)
-    fpl_player_name_to_id_lookup = {}
-
-    # This step is no longer needed as the cleaned CSV should have the correct team names
-    # team_list_df = pd.read_csv(f"{base_url}master_team_list.csv")
-    # team_id_to_name = dict(zip(team_list_df['team'], team_list_df['team_name']))
-    # fpl_df['opp_team_name'] = fpl_df['opponent_team'].map(team_id_to_name)
-
-    fpl_df['kickoff_time_date_only'] = pd.to_datetime(fpl_df['kickoff_time']).dt.strftime('%Y-%m-%d')
-    for _, row in fpl_df.iterrows():
-        key = (str(row['season_x']), to_int(row['element']), str(row['kickoff_time_date_only']))
-        val = (normalize_team_name(str(row['opp_team_name'])), bool(row['was_home']), to_int(row['GW']))
-        fpl_player_game_lookup[key].append(val)
-        fpl_player_name_to_id_lookup[(str(row['season_x']), str(row['name']).lower().strip())] = to_int(row['element'])
-    print("Successfully built FPL player game and name lookups for Understat matching.")
-
-    async with aiohttp.ClientSession() as session:
-        understat_client = Understat(session)
-        # We can narrow the years since we are using a specific file now, but keeping it broad is safer
-        for year in range(start_season, end_season + 1):
-            season_formatted = f"{year}-{(year + 1) % 100:02d}"
-            print(f"Fetching Understat league players for season {season_formatted}...")
-            league_players_understat = await understat_client.get_league_players("epl", year)
-            for player_summary in league_players_understat:
-                player_id = int(player_summary['id'])
-                player_name_understat = player_summary['player_name']
-                fpl_id = fpl_player_name_to_id_lookup.get((season_formatted, player_name_understat.lower().strip()),
-                                                          -1)
-                if fpl_id == -1:
-                    best_score = 70
-                    for (s_key, fpl_name_key), id_val in fpl_player_name_to_id_lookup.items():
-                        if s_key == season_formatted:
-                            score = fuzz.token_set_ratio(player_name_understat.lower().strip(), fpl_name_key)
-                            if score > best_score:
-                                best_score = score
-                                fpl_id = id_val
-                player_matches = await understat_client.get_player_matches(player_id)
-                for m_data in player_matches:
-                    match_date = pd.to_datetime(m_data['date']).strftime('%Y-%m-%d')
-                    lookup_key = (season_formatted, fpl_id, match_date)
-                    if lookup_key in fpl_player_game_lookup:
-                        m_data['fpl_id'] = fpl_id
-                        all_player_rows.append(m_data)
-
-    understat_df = pd.DataFrame(all_player_rows)
+    # This call now uses the robust, self-contained `fetch_understat_data` function
+    # which correctly validates matches using opponent names.
+    understat_df = await fetch_understat_data(fpl_df)
     print(f"Fetched {len(understat_df)} matched Understat game rows.")
 
     # --- Part 3: Merge FPL and Understat Data ---
     print("\n--- Part 3: Merging FPL and Understat data ---")
     if not understat_df.empty:
-        understat_df.rename(columns={'fpl_id': 'element'}, inplace=True)
-        understat_df['merge_date'] = pd.to_datetime(understat_df['date']).dt.date.astype(str)
+        # Reset the index from the Understat DataFrame to prepare for merging
+        understat_df_to_merge = understat_df.reset_index()
+        understat_df_to_merge.rename(columns={'fpl_id': 'element'}, inplace=True)
+
+        # Create consistent date-based keys for merging
+        understat_df_to_merge['merge_date'] = pd.to_datetime(understat_df_to_merge['date']).dt.date.astype(str)
         fpl_df['merge_date'] = pd.to_datetime(fpl_df['kickoff_time']).dt.date.astype(str)
 
         understat_cols_to_merge = ['element', 'merge_date', 'xG', 'xA', 'key_passes', 'npg', 'npxG', 'xGChain',
                                    'xGBuildup']
-        master_df = pd.merge(fpl_df, understat_df[understat_cols_to_merge], on=['element', 'merge_date'], how='left')
+        # Ensure all columns exist before trying to merge them
+        understat_cols_to_merge = [col for col in understat_cols_to_merge if col in understat_df_to_merge.columns]
+        master_df = pd.merge(fpl_df, understat_df_to_merge[understat_cols_to_merge], on=['element', 'merge_date'], how='left')
     else:
         master_df = fpl_df.copy()
 
@@ -425,7 +388,7 @@ async def load_and_process_data(base_url, start_season=2020, end_season=2023,
     # --- Part 5: Add Expected Points (xP) ---
     print("\n--- Part 5: Adding expected points (xP) ---")
     master_df = add_expected_points(master_df, base_url)
-    master_df.drop(columns=['merge_date', 'kickoff_time_date_only'], inplace=True, errors='ignore')
+    master_df.drop(columns=['merge_date'], inplace=True, errors='ignore')
     print(f"\nFinal processed dataset shape: {master_df.shape}")
     return master_df
 
@@ -483,15 +446,473 @@ def add_expected_points(master_df, base_url):
     return master_df
 
 
+def calculate_aggregate_stats(df):
+    """
+    Calculates season-to-date aggregate statistics for each player
+    on a gameweek-by-gameweek basis using an in-memory DataFrame.
+    This version specifically excludes Understat data from aggregation if it's marked as missing.
+    It also adds per 90 minute statistics for the aggregated columns.
+
+    Args:
+        df (pd.DataFrame): The master player data DataFrame, expected to contain gameweek data.
+
+    Returns:
+        pd.DataFrame: The DataFrame with added aggregate and per-90-minute columns.
+    """
+    print("\n--- Step 5: Calculating Aggregate Statistics ---")
+    # --- 1. Validate the incoming DataFrame ---
+    if df.empty:
+        print("Input DataFrame is empty. Skipping aggregate calculations.")
+        return df
+
+    # Check if 'understat_missing' column exists, as it's essential for the logic
+    if 'understat_missing' not in df.columns:
+        print("Error: 'understat_missing' column not found in the input DataFrame. Aborting aggregation.")
+        return df
+
+    # It's also a good idea to ensure 'kickoff_time' is a datetime object for robust sorting
+    if 'kickoff_time' in df.columns:
+        # Ensure it's datetime, handling potential errors
+        df['kickoff_time'] = pd.to_datetime(df['kickoff_time'], errors='coerce')
+    else:
+        print("Error: 'kickoff_time' column not found, which is required for sorting. Aborting aggregation.")
+        return df
+
+    # --- 2. Sort Data for Chronological Aggregation ---
+    df.sort_values(by=['season_x', 'element', 'kickoff_time'], inplace=True)
+    print("Data sorted by season, player (element), and kickoff_time for aggregation.")
+
+    # --- 3. Define Columns for Aggregation ---
+    understat_stats_to_aggregate = ['xG', 'xA', 'key_passes', 'npg', 'npxG', 'xGChain', 'xGBuildup']
+    other_stats_to_aggregate = [
+        'xP', 'goals_scored', 'saves', 'penalties_saved', 'assists',
+        'total_points', 'minutes', 'own_goals', 'penalties_missed', 'clean_sheets',
+        'threat', 'ict_index', 'influence', 'creativity'
+    ]
+
+    verified_understat_cols = [col for col in understat_stats_to_aggregate if col in df.columns]
+    verified_other_cols = [col for col in other_stats_to_aggregate if col in df.columns]
+    all_requested = understat_stats_to_aggregate + other_stats_to_aggregate
+    all_verified = verified_understat_cols + verified_other_cols
+    missing_cols = [col for col in all_requested if col not in all_verified]
+    if missing_cols:
+        print(f"Warning: The following columns were not found and will be skipped: {missing_cols}")
+
+    if not all_verified:
+        print("Error: None of the specified columns for aggregation exist in the input DataFrame. Aborting.")
+        return df
+
+    # --- FIX: Convert all aggregation columns to numeric to prevent 'object' dtype error ---
+    # Coerce errors will turn non-numeric values into NaN, which we then fill with 0.
+    for col in all_verified:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    print("Ensured all columns for aggregation are numeric.")
+
+    print("\n--- Calculating Aggregates ---")
+
+    # --- 4. Calculate Cumulative Sums with Conditional Logic for Understat columns ---
+    print("\nProcessing stats with 'understat_missing' condition:")
+    for col in verified_understat_cols:
+        aggregate_col_name = f'aggregate_{col}'
+        temp_col_name = f'temp_for_sum_{col}'
+        df[temp_col_name] = np.where(df['understat_missing'] == 1, 0, df[col])
+        df[aggregate_col_name] = df.groupby(['season_x', 'element'])[temp_col_name].cumsum()
+        df.drop(columns=[temp_col_name], inplace=True)
+        print(f"  > Created '{aggregate_col_name}' column (conditional).")
+
+    # --- 5. Calculate Standard Cumulative Sums for Other Stats ---
+    print("\nProcessing standard stats:")
+    for col in verified_other_cols:
+        aggregate_col_name = f'aggregate_{col}'
+        df[aggregate_col_name] = df.groupby(['season_x', 'element'])[col].cumsum()
+        print(f"  > Created '{aggregate_col_name}' column.")
+
+    # --- 6. Calculate "Per 90 Minutes" Statistics ---
+    print("\n--- Calculating Per 90 Minute Statistics ---")
+    if 'aggregate_minutes' in df.columns:
+        # Calculate the number of 90-minute periods played
+        df['num_90s'] = df['aggregate_minutes'] / 90.0
+
+        # Define all columns that have been aggregated (excluding minutes itself)
+        stats_for_per_90 = verified_understat_cols + [col for col in verified_other_cols if col != 'minutes']
+
+        for col in stats_for_per_90:
+            aggregate_col_name = f'aggregate_{col}'
+            per_90_col_name = f'per_90_{col}'
+
+            # Calculate the per-90 stat, handling cases with 0 minutes to avoid division by zero
+            df[per_90_col_name] = np.where(
+                df['num_90s'] > 0,
+                df[aggregate_col_name] / df['num_90s'],
+                0
+            )
+            print(f"  > Created '{per_90_col_name}' column.")
+
+        # Clean up the intermediate 'num_90s' column
+        df.drop(columns=['num_90s'], inplace=True)
+    else:
+        print("Warning: 'aggregate_minutes' column not found. Cannot calculate per 90 stats.")
+
+    print(f"\nSuccessfully calculated aggregate stats. Final DataFrame shape: {df.shape}")
+    return df
+
+def calculate_form_stats(df):
+    """
+    Calculates rolling 3 and 5-gameweek form statistics from a DataFrame.
+
+    This function handles Understat columns conditionally, excluding gameweeks from the average
+    where data is marked as missing.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing aggregate player data.
+
+    Returns:
+        pd.DataFrame: The DataFrame with added form statistics columns.
+    """
+    print("\n--- Step 6: Calculating Rolling Form Statistics ---")
+    # --- 1. Validate the incoming DataFrame ---
+    if df.empty:
+        print("Input DataFrame is empty. Skipping form calculations.")
+        return df
+
+    required_cols = ['understat_missing', 'kickoff_time', 'season_x', 'element']
+    if not all(col in df.columns for col in required_cols):
+        print(f"Error: Missing one or more required columns for form calculation: {required_cols}. Aborting.")
+        return df
+
+    # --- 2. Sort Data for Chronological Rolling Calculations ---
+    df['kickoff_time'] = pd.to_datetime(df['kickoff_time'])
+    df.sort_values(by=['season_x', 'element', 'kickoff_time'], inplace=True)
+    print("Data sorted by season, player, and kickoff_time for form calculations.")
+
+    # --- 3. Define Columns and Windows for Form Calculation ---
+    stats_to_process = [
+        'xP', 'goals_scored', 'saves', 'penalties_saved', 'assists', 'xG', 'xA',
+        'total_points', 'minutes', 'key_passes', 'npg', 'npxG', 'xGChain',
+        'xGBuildup', 'own_goals', 'penalties_missed', 'clean_sheets', 'bps',
+        'threat', 'ict_index', 'influence', 'creativity'
+    ]
+    understat_related_stats = [
+        'xG', 'xA', 'key_passes', 'npg', 'npxG', 'xGChain', 'xGBuildup'
+    ]
+    rolling_windows = [3, 5]
+    all_form_cols = []
+    verified_stats = [col for col in stats_to_process if col in df.columns]
+
+    # --- 4. Calculate Form using rolling windows ---
+    for window in rolling_windows:
+        print(f"\n--- Calculating {window}-Gameweek Rolling Form Statistics ---")
+        for col in verified_stats:
+            form_col_name = f'form_{window}gw_{col}'  # Changed name for clarity
+            all_form_cols.append(form_col_name)
+
+            if col in understat_related_stats:
+                # Conditional calculation: set stat to NaN where understat data is missing
+                temp_stat_col = f'temp_{col}'
+                df[temp_stat_col] = np.where(df['understat_missing'] == 1, np.nan, df[col])
+                # Rolling mean automatically ignores NaNs
+                rolling_avg = df.groupby(['season_x', 'element'])[temp_stat_col].rolling(window=window,
+                                                                                         min_periods=1).mean()
+                df[form_col_name] = rolling_avg.reset_index(level=[0, 1], drop=True)
+                df.drop(columns=[temp_stat_col], inplace=True)
+            else:
+                # Standard rolling average
+                rolling_avg = df.groupby(['season_x', 'element'])[col].rolling(window=window, min_periods=1).mean()
+                df[form_col_name] = rolling_avg.reset_index(level=[0, 1], drop=True)
+
+    # --- 5. Clean up ---
+    df[all_form_cols] = df[all_form_cols].fillna(0)
+    print("\nFilled any potential NaN values in new form columns with 0.")
+
+    print(f"Successfully calculated form stats. Final DataFrame shape: {df.shape}")
+    return df
+
+
+# <<< STEP 7: Refactored team_data.py >>>
+def add_team_strength_and_form(player_df, base_url):
+    """
+    Adds team strength and form columns to the player data using in-memory DataFrames.
+
+    This function uses kickoff_time to uniquely identify matches, correctly
+    handling double gameweeks and providing more accurate stats.
+
+    Args:
+        player_df (pd.DataFrame): The main DataFrame with player and form stats.
+        base_url (str): The base URL for fetching auxiliary data like the team list.
+
+    Returns:
+        pd.DataFrame: The DataFrame with added team strength and form columns.
+    """
+    print("\n--- Step 7: Adding Team Strength and Form ---")
+    # --- 1. Load Auxiliary Dataset ---
+    try:
+        if 'kickoff_time' not in player_df.columns:
+            raise ValueError("Input DataFrame must contain a 'kickoff_time' column.")
+        player_df['kickoff_time'] = pd.to_datetime(player_df['kickoff_time'])
+
+        team_list_url = f"{base_url}master_team_list.csv"
+        team_list_df = pd.read_csv(team_list_url)
+        print(f"Successfully loaded team list from '{team_list_url}'.")
+    except Exception as e:
+        print(f"An error occurred while preparing data: {e}")
+        return player_df
+
+    # --- 2. Map Team Names to Integer IDs ---
+    team_list_df = team_list_df[['season', 'team', 'team_name']]
+    team_list_df.rename(columns={'season': 'season_x', 'team_name': 'team_x'}, inplace=True)
+    player_df = pd.merge(player_df, team_list_df, on=['season_x', 'team_x'], how='left')
+
+    # --- 3. Calculate Match Points ---
+    conditions = [
+        (player_df['was_home'] & (player_df['team_h_score'] > player_df['team_a_score'])),
+        (~player_df['was_home'] & (player_df['team_a_score'] > player_df['team_h_score'])),
+        (player_df['team_h_score'] == player_df['team_a_score'])
+    ]
+    choices = [3, 3, 1]
+    player_df['match_points'] = np.select(conditions, choices, default=0)
+
+    # --- 4. Create and build the Team-Match DataFrame ---
+    print("Creating and calculating all team-level statistics (per-match)...")
+    team_match_df = player_df.groupby(['season_x', 'team', 'kickoff_time', 'GW']).agg(
+        opponent_team=('opponent_team', 'first'),
+        match_points=('match_points', 'first')
+    ).reset_index()
+
+    team_match_df.sort_values(by=['season_x', 'team', 'kickoff_time'], inplace=True)
+
+    # Calculate cumulative points and form
+    team_match_df['cumulative_points'] = team_match_df.groupby(['season_x', 'team'])['match_points'].cumsum()
+    team_match_df['team_form'] = team_match_df.groupby(['season_x', 'team'])['match_points'].transform(
+        lambda x: x.rolling(window=5, min_periods=1).mean()
+    )
+
+    # Calculate team_strength robustly for double gameweeks
+    final_gw_stats = team_match_df.sort_values('kickoff_time').groupby(['season_x', 'team', 'GW']).last().reset_index()
+    final_gw_stats['team_strength'] = final_gw_stats.groupby(['season_x', 'GW'])['cumulative_points'].rank(method='min',
+                                                                                                           ascending=False)
+
+    team_match_df = pd.merge(team_match_df, final_gw_stats[['season_x', 'team', 'GW', 'team_strength']],
+                             on=['season_x', 'team', 'GW'], how='left')
+
+    # Calculate opponent team strength
+    strength_lookup_df = final_gw_stats[['season_x', 'GW', 'team', 'team_strength']].rename(
+        columns={'team': 'opponent_team', 'team_strength': 'opp_team_strength'}
+    )
+    team_match_df = pd.merge(team_match_df, strength_lookup_df, on=['season_x', 'GW', 'opponent_team'], how='left')
+
+    # Calculate upcoming fixture strength
+    upcoming_strengths_df = pd.DataFrame(index=team_match_df.index)
+    for i in range(1, 6):
+        upcoming_strengths_df[f'next_opp_strength_{i}'] = team_match_df.groupby(['season_x', 'team'])[
+            'opp_team_strength'].shift(-i)
+    team_match_df['upcoming_strength'] = upcoming_strengths_df.mean(axis=1)
+    team_match_df['upcoming_strength'] = team_match_df.groupby(['season_x', 'team'])['upcoming_strength'].ffill()
+
+    # --- 5. Perform a Single, Final Merge ---
+    print("Merging all team-level stats back to the player dataset...")
+    cols_to_merge = ['season_x', 'kickoff_time', 'team', 'team_strength', 'team_form', 'opp_team_strength',
+                     'upcoming_strength']
+    final_df = pd.merge(player_df, team_match_df[cols_to_merge], on=['season_x', 'kickoff_time', 'team'], how='left')
+    final_df.drop(columns=['match_points'], inplace=True, errors='ignore')
+
+    # --- 6. Validation Step ---
+    if len(final_df) > len(player_df):
+        print(
+            f"CRITICAL WARNING: Row count increased from {len(player_df)} to {len(final_df)}. Duplicates may have been created.")
+    else:
+        print(f"Row count validation passed. Final row count is {len(final_df)}.")
+
+    print(f"Successfully added team data. Final DataFrame shape: {final_df.shape}")
+    return final_df
+
+
+# <<< STEP 8: Refactored reorder_and_add_labels.py >>>
+
+# --- Helper functions for DGW processing ---
+def _create_dgw_row(group: pd.DataFrame) -> pd.Series:
+    """Helper function to process a single player's DGW into one row."""
+    group = group.sort_values('kickoff_time', ascending=True)
+    first_match = group.iloc[0]
+    second_match = group.iloc[-1]
+    new_row = {}
+    sum_cols = [
+        'assists', 'bonus', 'bps', 'clean_sheets', 'creativity', 'goals_conceded',
+        'goals_scored', 'ict_index', 'influence', 'minutes', 'own_goals',
+        'penalties_missed', 'penalties_saved', 'red_cards', 'saves',
+        'team_a_score', 'team_h_score', 'threat', 'total_points', 'yellow_cards',
+        'xG', 'xA', 'key_passes', 'npg', 'npxG', 'xGChain', 'xGBuildup', 'xP'
+    ]
+    first_match_cols = [
+        'season_x', 'name', 'position', 'team_x', 'element', 'fixture', 'kickoff_time',
+        'transfers_balance', 'transfers_in', 'transfers_out', 'value', 'was_home',
+        'round', 'GW', 'team', 'team_form', 'team_strength', 'upcoming_strength'
+    ]
+    # All other columns are taken from the second match by default
+    all_cols = set(group.columns)
+    second_match_cols = list(all_cols - set(sum_cols) - set(first_match_cols))
+
+    for col in sum_cols:
+        if col in group.columns: new_row[col] = group[col].sum()
+    for col in first_match_cols:
+        if col in group.columns: new_row[col] = first_match[col]
+    for col in second_match_cols:
+        if col in group.columns: new_row[col] = second_match[col]
+
+    new_row['opponent_team_1'] = first_match['opponent_team']
+    new_row['opp_team_strength_1'] = first_match['opp_team_strength']
+    new_row['opponent_team_2'] = second_match['opponent_team']
+    new_row['opp_team_strength_2'] = second_match['opp_team_strength']
+    new_row['is_dgw'] = 1
+    return pd.Series(new_row)
+
+
+def combine_dgw(df: pd.DataFrame) -> pd.DataFrame:
+    """Consolidates DGW rows in a DataFrame."""
+    df = df.copy()
+    dgw_identifiers = ['season_x', 'element', 'GW']
+    dgw_mask = df.duplicated(subset=dgw_identifiers, keep=False)
+    sgw_df = df[~dgw_mask].copy()
+    dgw_df = df[dgw_mask].copy()
+
+    sgw_df['is_dgw'] = 0
+    sgw_df.rename(columns={'opponent_team': 'opponent_team_1', 'opp_team_strength': 'opp_team_strength_1'},
+                  inplace=True)
+    sgw_df['opponent_team_2'] = np.nan
+    sgw_df['opp_team_strength_2'] = np.nan
+
+    if not dgw_df.empty:
+        processed_dgw_df = dgw_df.groupby(dgw_identifiers, as_index=False).apply(_create_dgw_row)
+        final_df = pd.concat([sgw_df, processed_dgw_df], ignore_index=True, sort=False)
+    else:
+        final_df = sgw_df
+    return final_df
+
+
+# --- Main processing function for this step ---
+def reorder_and_add_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Processes FPL data by consolidating DGWs, creating future labels and flags,
+    and reordering columns for modeling.
+
+    Args:
+        df: The DataFrame with all previously added features.
+
+    Returns:
+        The final, processed DataFrame ready for modeling.
+    """
+    print("\n--- Step 8: Consolidating DGWs, Adding Labels, and Reordering ---")
+    PLANNING_HORIZON = 6
+
+    # 1. Consolidate Double Gameweeks
+    df = combine_dgw(df)
+    print("Consolidated double gameweeks.")
+
+    # 2. Filter out old seasons
+    seasons_to_remove = ['2016-17', '2017-18']
+    df = df[~df['season_x'].isin(seasons_to_remove)]
+    print(f"Removed seasons {seasons_to_remove}. Remaining rows: {len(df)}.")
+
+    # 3. Create complete timelines for each player to ensure accurate shifts
+    df.sort_values(['season_x', 'element', 'GW'], inplace=True)
+
+    def create_complete_timeline(group):
+        full_gw_range = pd.RangeIndex(start=1, stop=38 + 1, name='GW')
+        group = group.set_index('GW').reindex(full_gw_range)
+        group['element'].fillna(method='ffill', inplace=True)
+        group['season_x'].fillna(method='ffill', inplace=True)
+        group['is_dgw'].fillna(0, inplace=True)
+        return group.reset_index()
+
+    df = df.groupby(['season_x', 'element'], group_keys=False).apply(create_complete_timeline)
+
+    # 4. Create future DGW flags and target labels
+    grouped = df.groupby(['season_x', 'element'])
+    new_cols_data = {}
+    label_cols = []
+    dgw_flag_cols = []
+
+    for i in range(1, PLANNING_HORIZON + 1):
+        # DGW flags
+        dgw_col = f'is_dgw_in_gw+{i}'
+        new_cols_data[dgw_col] = grouped['is_dgw'].shift(-i).fillna(0).astype(int)
+        dgw_flag_cols.append(dgw_col)
+        # Target labels
+        points_col = f'points_gw+{i}'
+        minutes_col = f'minutes_gw+{i}'
+        new_cols_data[points_col] = grouped['total_points'].shift(-i)
+        new_cols_data[minutes_col] = grouped['minutes'].shift(-i)
+        label_cols.extend([points_col, minutes_col])
+
+    labels_df = pd.DataFrame(new_cols_data, index=df.index)
+    df = pd.concat([df, labels_df], axis=1)
+    print(f"Created target labels and DGW flags for a {PLANNING_HORIZON}-week horizon.")
+
+    # 5. Clean up and reorder
+    df.dropna(subset=['fixture'], inplace=True)  # Remove placeholder rows
+    print("Removed placeholder rows used for label creation.")
+
+    categorical_cols = ['team', 'GW', 'was_home', 'round', 'opponent_team_1', 'opponent_team_2', 'element', 'season_x',
+                        'name', 'position', 'team_x', 'fixture']
+    final_ordered_list = label_cols + dgw_flag_cols + ['is_dgw'] + categorical_cols
+
+    # Add all remaining columns
+    for col in df.columns:
+        if col not in final_ordered_list:
+            final_ordered_list.append(col)
+
+    df = df[final_ordered_list]
+    print("Successfully reordered all columns.")
+
+    print(f"Final processing complete. DataFrame shape: {df.shape}")
+    return df
+
+
 # --- Main Execution Block ---
 if __name__ == "__main__":
     print("--- Starting FPL Data Pipeline ---")
-    final_df = asyncio.run(load_and_process_data(BASE_URL))
-    try:
-        output_filename = "test_output_corrected.csv"
-        final_df.to_csv(output_filename, index=False)
-        print(f"\n--- TEST COMPLETE ---")
-        print(f"Successfully saved intermediate results to '{output_filename}' for review.")
-    except Exception as e:
-        print(f"\nError saving test CSV file: {e}")
-    print("\n--- Pipeline Paused for Review ---")
+
+    # --- Phase 1: Data Ingestion ---
+    print("\n--- Phase 1: Running Data Ingestion ---")
+    ingested_df = asyncio.run(load_and_process_data(BASE_URL))
+
+    if not ingested_df.empty:
+        print(f"--- Data Ingestion Complete. Shape: {ingested_df.shape} ---")
+
+        # --- ADDED: Save pre-aggregation data for review as requested ---
+        try:
+            pre_agg_filename = "../../backend/pre_aggregation_data.csv"
+            ingested_df.to_csv(pre_agg_filename, index=False)
+            print(f"\n--- PIPELINE CHECKPOINT ---")
+            print(f"Successfully saved data before aggregation to '{pre_agg_filename}' for review.")
+        except Exception as e:
+            print(f"\nError saving pre-aggregation CSV file: {e}")
+
+        # --- Phase 2: Feature Engineering ---
+        print("\n--- Phase 2: Running Feature Engineering ---")
+
+        # Step 5: Calculate Aggregate Stats
+        df_with_aggregates = calculate_aggregate_stats(ingested_df)
+
+        # Step 6: Calculate Rolling Form Stats
+        df_with_form = calculate_form_stats(df_with_aggregates)
+
+        # Step 7: Add Team Strength and Form
+        df_with_team_data = add_team_strength_and_form(df_with_form, BASE_URL)
+
+        # Step 8: Reorder columns and add target labels
+        final_features_df = reorder_and_add_labels(df_with_team_data)
+
+        try:
+            # Save the final result of the feature engineering pipeline
+            output_filename = "../../backend/final_features_for_modeling.csv"
+            final_features_df.to_csv(output_filename, index=False)
+            print(f"\n--- PIPELINE CHECKPOINT ---")
+            print(f"Successfully saved final processed data to '{output_filename}' for review.")
+            print(f"Final shape before modeling: {final_features_df.shape}")
+
+        except Exception as e:
+            print(f"\nError saving final CSV file: {e}")
+    else:
+        print("\nData ingestion resulted in an empty DataFrame. Halting pipeline.")
+
+    print("\n--- All Feature Engineering Steps Complete ---")
